@@ -200,7 +200,7 @@ def refresh_gitmodules(ctx):
     wr(b'data %d' % (len(gitmodules)+1))
     wr(gitmodules)
 
-def export_file_contents(ctx,manifest,files,hgtags,encoding='',plugins={}):
+def export_file_contents(ctx,manifest,files,hgtags,encoding='',plugins={}, fname_fix=None):
   count=0
   max=len(files)
   is_submodules_refreshed=False
@@ -222,7 +222,13 @@ def export_file_contents(ctx,manifest,files,hgtags,encoding='',plugins={}):
       )
       continue
     file_ctx=ctx.filectx(file)
-    d=file_ctx.data()
+    try:
+      d=file_ctx.data()
+    except Exception as e:
+      stderr_buffer.write(
+        b'Unable to read file %s while importing ctx=%s\n' % (filename, str(ctx).encode('utf8'))
+      )
+      raise e
 
     if plugins and plugins['file_data_filters']:
       file_data = {'filename':filename,'file_ctx':file_ctx,'data':d}
@@ -231,6 +237,9 @@ def export_file_contents(ctx,manifest,files,hgtags,encoding='',plugins={}):
       d=file_data['data']
       filename=file_data['filename']
       file_ctx=file_data['file_ctx']
+
+    if fname_fix:
+      filename = fname_fix(filename)
 
     wr(b'M %s inline %s' % (gitmode(manifest.flags(file)),
                            strip_leading_slash(filename)))
@@ -317,6 +326,61 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
     user = commit_data['committer']
     desc = commit_data['desc']
 
+  ctx=revsymbol(repo, b"%d" % revision)
+  man=ctx.manifest()
+  added,changed,removed,type=[],[],[],''
+
+  if len(parents) == 0:
+    # first revision: feed in full manifest
+    added=man.keys()
+    added.sort()
+    type='full'
+  else:
+    # --- wr(b'from %s' % revnum_to_revref(parents[0], old_marks))
+    if len(parents) == 1:
+      # later non-merge revision: feed in changed manifest
+      # if we have exactly one parent, just take the changes from the
+      # manifest without expensively comparing checksums
+      f=repo.status(parents[0],revnode)
+      added,changed,removed=f.added,f.modified,f.removed
+      type='simple delta'
+    else: # a merge with two parents
+      # --- wr(b'merge %s' % revnum_to_revref(parents[1], old_marks))
+      # later merge revision: feed in changed manifest
+      # for many files comparing checksums is expensive so only do it for
+      # merges where we really need it due to hg's revlog logic
+      added,changed,removed=get_filechanges(repo,revision,parents,man)
+      type='thorough delta'
+
+  # maybe filter the commit
+  fname_mapping = {}
+
+  if plugins and plugins.get('file_name_filters'):
+    def filter_files(files):
+      result = []
+      for filename in files:
+        new_filename = filename
+        for filter in plugins['file_name_filters']:
+          new_filename = filter(new_filename)
+        fname_mapping[filename] = new_filename
+        if new_filename:
+          result.append(filename)
+      return result
+    added = filter_files(added)
+    changed = filter_files(changed)
+    removed = filter_files(removed)
+    if len(added) + len(changed) + len(removed) == 0 and len(parents) >= 1:
+      old_marks[revision] = revnum_to_revref(parents[0], old_marks)
+      return count
+  stderr_buffer.write(
+    b'%s: Exporting %s revision %d/%d with %d/%d/%d added/changed/removed files\n'
+    % (branch, type.encode(), revision + 1, max, len(added), len(changed), len(removed))
+  )
+
+  def fname_fix(fname):
+    r = fname_mapping.get(fname)
+    return r if r else fname
+
   if len(parents)==0 and revision != 0:
     wr(b'reset refs/heads/%s' % branch)
 
@@ -328,37 +392,10 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
   wr(b'data %d' % (len(desc)+1)) # wtf?
   wr(desc)
   wr()
-
-  ctx=revsymbol(repo, b"%d" % revision)
-  man=ctx.manifest()
-  added,changed,removed,type=[],[],[],''
-
-  if len(parents) == 0:
-    # first revision: feed in full manifest
-    added=man.keys()
-    added.sort()
-    type='full'
-  else:
+  if len(parents) > 0:
     wr(b'from %s' % revnum_to_revref(parents[0], old_marks))
-    if len(parents) == 1:
-      # later non-merge revision: feed in changed manifest
-      # if we have exactly one parent, just take the changes from the
-      # manifest without expensively comparing checksums
-      f=repo.status(parents[0],revnode)
-      added,changed,removed=f.added,f.modified,f.removed
-      type='simple delta'
-    else: # a merge with two parents
+    if len(parents) > 1:
       wr(b'merge %s' % revnum_to_revref(parents[1], old_marks))
-      # later merge revision: feed in changed manifest
-      # for many files comparing checksums is expensive so only do it for
-      # merges where we really need it due to hg's revlog logic
-      added,changed,removed=get_filechanges(repo,revision,parents,man)
-      type='thorough delta'
-
-  stderr_buffer.write(
-    b'%s: Exporting %s revision %d/%d with %d/%d/%d added/changed/removed files\n'
-    % (branch, type.encode(), revision + 1, max, len(added), len(changed), len(removed))
-  )
 
   for filename in removed:
     if fn_encoding:
@@ -366,10 +403,10 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
     filename=strip_leading_slash(filename)
     if filename==b'.hgsub':
       remove_gitmodules(ctx)
-    wr(b'D %s' % filename)
+    wr(b'D %s' % fname_fix(filename))
 
-  export_file_contents(ctx,man,added,hgtags,fn_encoding,plugins)
-  export_file_contents(ctx,man,changed,hgtags,fn_encoding,plugins)
+  export_file_contents(ctx,man,added,hgtags,fn_encoding,plugins, fname_fix)
+  export_file_contents(ctx,man,changed,hgtags,fn_encoding,plugins, fname_fix)
   wr()
 
   return checkpoint(count)
@@ -710,6 +747,7 @@ if __name__=='__main__':
   plugins_dict={}
   plugins_dict['commit_message_filters']=[]
   plugins_dict['file_data_filters']=[]
+  plugins_dict['file_name_filters']=[]
 
   if plugins and options.pluginpath:
     sys.stderr.write('Using additional plugin path: ' + options.pluginpath + '\n')
@@ -724,6 +762,8 @@ if __name__=='__main__':
       plugins_dict['file_data_filters'].append(plugin.file_data_filter)
     if hasattr(plugin, 'commit_message_filter') and callable(plugin.commit_message_filter):
       plugins_dict['commit_message_filters'].append(plugin.commit_message_filter)
+    if hasattr(plugin, 'file_name_filter') and callable(plugin.file_name_filter):
+      plugins_dict['file_name_filters'].append(plugin.file_name_filter)
 
   sys.exit(hg2git(options.repourl,m,options.marksfile,options.mappingfile,
                   options.headsfile, options.statusfile,
