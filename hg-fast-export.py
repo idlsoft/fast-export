@@ -293,6 +293,7 @@ def strip_leading_slash(filename):
     return filename[1:]
   return filename
 
+remapped_parents = {}
 def export_commit(ui,repo,revision,old_marks,max,count,authors,
                   branchesmap,sob,brmap,hgtags,encoding='',fn_encoding='',
                   plugins={}):
@@ -309,7 +310,13 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
 
   branch=get_branchname(branch)
 
-  parents = [p for p in repo.changelog.parentrevs(revision) if p >= 0]
+  o_parents = [p for p in repo.changelog.parentrevs(revision) if p >= 0]
+  parents = []
+  for p in o_parents:
+    for rp in remapped_parents.get(p, [p]):
+      if rp not in remapped_parents and rp not in parents:
+        parents.append(rp)
+
   author = get_author(desc,user,authors)
   hg_hash=revsymbol(repo,b"%d" % revision).hex()
 
@@ -369,12 +376,17 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
     added = filter_files(added)
     changed = filter_files(changed)
     removed = filter_files(removed)
-    if len(added) + len(changed) + len(removed) == 0 and len(parents) >= 1:
-      old_marks[revision] = revnum_to_revref(parents[0], old_marks)
+    short_desc = desc.split(b'\n', maxsplit=1)[0]
+    if len(added) + len(changed) + len(removed) == 0:
+      remapped_parents[revision] = parents
+      stderr_buffer.write(
+        b'%s: Skipping %s revision %d/%d with %d/%d/%d added/changed/removed files  %s\n'
+        % (branch, type.encode(), revision + 1, max, len(added), len(changed), len(removed), short_desc)
+      )
       return count
   stderr_buffer.write(
-    b'%s: Exporting %s revision %d/%d with %d/%d/%d added/changed/removed files\n'
-    % (branch, type.encode(), revision + 1, max, len(added), len(changed), len(removed))
+    b'%s: Exporting %s revision %d/%d with %d/%d/%d added/changed/removed files  %s\n'
+    % (branch, type.encode(), revision + 1, max, len(added), len(changed), len(removed), short_desc)
   )
 
   def fname_fix(fname):
@@ -443,7 +455,11 @@ def export_tags(ui,repo,old_marks,mapping_cache,count,authors,tagsmap):
       continue
 
     rev=int(mapping_cache[hexlify(node)])
-
+    if rev in remapped_parents:
+      stderr_buffer.write(
+        b'Tag %s refers to skipped revision r%d\n' % (tag, rev)
+      )
+      continue
     ref=revnum_to_revref(rev, old_marks)
     if ref==None:
       stderr_buffer.write(
@@ -559,7 +575,7 @@ def verify_heads(ui,repo,cache,force,ignore_unnamed_heads,branchesmap):
   return True
 
 def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
-           authors={},branchesmap={},tagsmap={},
+           revs=None, authors={},branchesmap={},tagsmap={},
            sob=False,force=False,ignore_unnamed_heads=False,hgtags=False,notes=False,encoding='',fn_encoding='',
            plugins={}):
   def check_cache(filename, contents):
@@ -584,17 +600,26 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
   if not verify_heads(ui,repo,heads_cache,force,ignore_unnamed_heads,branchesmap):
     return 1
 
-  try:
-    tip=repo.changelog.count()
-  except AttributeError:
-    tip=len(repo)
+  if revs:
+    revisions_to_import = repo.revs(revs)
+    max = len(revisions_to_import)
+    revisions_to_map = revisions_to_import
+    first_note_rev = -1
+  else:
+    try:
+      tip=repo.changelog.count()
+    except AttributeError:
+      tip=len(repo)
 
-  min=int(state_cache.get(b'tip',0))
-  max=_max
-  if _max<0 or max>tip:
-    max=tip
+    min=int(state_cache.get(b'tip',0))
+    max=_max
+    if _max<0 or max>tip:
+      max=tip
+    revisions_to_import = range(min,max)
+    revisions_to_map = range(0, max)
+    first_note_rev = min if min != 0 else -1
 
-  for rev in range(0,max):
+  for rev in revisions_to_map:
     (revnode,_,_,_,_,_,_,_)=get_changeset(ui,repo,rev,authors)
     if repo[revnode].hidden():
       continue
@@ -602,7 +627,7 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
 
   if submodule_mappings:
     # Make sure that all mercurial submodules are registered in the submodule-mappings file
-    for rev in range(0,max):
+    for rev in revisions_to_import:
       ctx=revsymbol(repo,b"%d" % rev)
       if ctx.hidden():
         continue
@@ -614,15 +639,24 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
 
   c=0
   brmap={}
-  for rev in range(min,max):
+  excluded = {}
+  s_tip = None
+
+  for rev in revisions_to_import:
+    c_old = c
     c=export_commit(ui,repo,rev,old_marks,max,c,authors,branchesmap,
                     sob,brmap,hgtags,encoding,fn_encoding,
                     plugins)
+    if c != c_old:
+      s_tip = rev
+    if notes and c_old == c:
+      excluded[rev] = rev
   if notes:
-    for rev in range(min,max):
-      c=export_note(ui,repo,rev,c,authors, encoding, rev == min and min != 0)
+    for rev in revisions_to_import:
+      if rev not in excluded:
+        c=export_note(ui,repo,rev,c,authors, encoding, rev == first_note_rev)
 
-  state_cache[b'tip']=max
+  state_cache[b'tip']=s_tip
   state_cache[b'repo']=repourl
   save_cache(tipfile,state_cache)
   save_cache(mappingfile,mapping_cache)
@@ -646,6 +680,8 @@ if __name__=='__main__':
       help="Do not perform built-in (broken in many cases) sanitizing of names")
   parser.add_option("-m","--max",type="int",dest="max",
       help="Maximum hg revision to import")
+  parser.add_option("--revs",dest="revs",
+      help="revisions to import, ex: ::@")
   parser.add_option("--mapping",dest="mappingfile",
       help="File to read last run's hg-to-git SHA1 mapping")
   parser.add_option("--marks",dest="marksfile",
@@ -767,6 +803,7 @@ if __name__=='__main__':
 
   sys.exit(hg2git(options.repourl,m,options.marksfile,options.mappingfile,
                   options.headsfile, options.statusfile,
+                  revs=options.revs,
                   authors=a,branchesmap=b,tagsmap=t,
                   sob=options.sob,force=options.force,
                   ignore_unnamed_heads=options.ignore_unnamed_heads,
