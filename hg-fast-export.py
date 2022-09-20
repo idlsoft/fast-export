@@ -473,6 +473,25 @@ def export_tags(ui,repo,old_marks,mapping_cache,count,authors,tagsmap):
     count=checkpoint(count)
   return count
 
+def export_branches(ui, repo, branches, old_marks):
+  for branch in branches:
+    branch = branch.encode()
+    node = repo.lookup(branch)
+    rev = repo.changelog.rev(node)
+    while rev and rev in remapped_parents:
+      p = repo.changelog.parentrevs(rev)
+      rev = p[0] if len(p) > 1 else None
+    if rev:
+      rev = revnum_to_revref(rev, old_marks)
+      if branch == b'@':
+        branch =  get_branch(b'')
+      stderr_buffer.write(b'Setting branch %s to commit %s\n' % (branch, rev))
+      wr(b'reset refs/heads/%s' % branch)
+      wr(b'from %s' % rev)
+      wr()
+    else:
+      stderr_buffer.write(b'Skipped creating branch %s because of filtered commit\n' % branch)
+
 def load_mapping(name, filename, mapping_is_raw):
   raw_regexp=re.compile(b'^([^=]+)[ ]*=[ ]*(.+)$')
   string_regexp=b'"(((\\.)|(\\")|[^"])*)"'
@@ -600,7 +619,13 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
   if not verify_heads(ui,repo,heads_cache,force,ignore_unnamed_heads,branchesmap):
     return 1
 
+  branches_to_import = None
+
   if revs:
+    if ',' in revs or revs == '@':
+      branches_to_import = revs.split(',')
+      revs = ' or '.join([f'::"{b}"' for b in branches_to_import])
+
     revisions_to_import = repo.revs(revs)
     max = len(revisions_to_import)
     revisions_to_map = revisions_to_import
@@ -663,6 +688,9 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
 
   c=export_tags(ui,repo,old_marks,mapping_cache,c,authors,tagsmap)
 
+  if branches_to_import:
+    export_branches(ui, repo, branches_to_import, old_marks)
+
   sys.stderr.write('Issued %d commands\n' % c)
 
   return 0
@@ -681,7 +709,7 @@ if __name__=='__main__':
   parser.add_option("-m","--max",type="int",dest="max",
       help="Maximum hg revision to import")
   parser.add_option("--revs",dest="revs",
-      help="revisions to import, ex: ::@")
+      help="revisions to import, ex: ::@, @,bookmark1,bookmark2")
   parser.add_option("--mapping",dest="mappingfile",
       help="File to read last run's hg-to-git SHA1 mapping")
   parser.add_option("--marks",dest="marksfile",
