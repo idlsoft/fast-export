@@ -356,7 +356,7 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
       # later merge revision: feed in changed manifest
       # for many files comparing checksums is expensive so only do it for
       # merges where we really need it due to hg's revlog logic
-      added,changed,removed=get_filechanges(repo,revision,parents,man)
+      added,changed,removed=get_filechanges(repo,revision,o_parents,man)
       type='thorough delta'
 
   # maybe filter the commit
